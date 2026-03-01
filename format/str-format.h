@@ -255,6 +255,17 @@ namespace str {
 		return sink;
 	}
 
+	/* format a value using si-units */
+	template <str::IsNumber NumType, str::IsStr UnitType>
+	struct Si {
+	public:
+		std::basic_string_view<str::StringChar<UnitType>> unit;
+		NumType value = 0;
+
+	public:
+		constexpr Si(NumType value, const UnitType& unit) : value{ value }, unit{ unit } {}
+	};
+
 	/* bind the given value to be formatted using the given formatting-string, which is useful to format build-output (no own formatting)
 	*	Note: Must not outlive the value object as it stores a reference to it */
 	template <str::IsStr FmtType, str::IsFormattable Type>
@@ -294,15 +305,15 @@ namespace str {
 	template <class Type>
 	Range(const Type&) -> Range<typename Type::const_iterator>;
 
-	/* format a value using si-units */
-	template <str::IsNumber NumType, str::IsStr UnitType>
-	struct Si {
+	/* add a formatted value multiple times */
+	template <str::IsFormattable Type>
+	struct Repeat {
 	public:
-		std::basic_string_view<str::StringChar<UnitType>> unit;
-		NumType value = 0;
+		const Type& value;
+		size_t count = 0;
 
 	public:
-		constexpr Si(NumType value, const UnitType& unit) : value{ value }, unit{ unit } {}
+		constexpr Repeat(const Type& value, size_t count = 1) : value{ value }, count{ count } {}
 	};
 
 	/*	Normal padding: in Order; all optional
@@ -705,6 +716,70 @@ namespace str {
 			if (prefix.empty() && always)
 				str::CodepointTo<str::CodeError::replace>(sink, U' ', (two ? 2 : 1));
 		}
+
+		inline std::pair<std::u32string_view, std::u32string_view> ParseElementFormatting(std::u32string_view fmt, std::u32string& _buffer) {
+			/* split off the separator and element formatter */
+			std::u32string_view format;
+			bool escapedSeparator = false;
+			for (size_t i = 0; i < fmt.size(); ++i) {
+				if (fmt[i] != U'@')
+					continue;
+				if (++i >= fmt.size() || fmt[i] != U'@') {
+					format = fmt.substr(i);
+					fmt = fmt.substr(0, i - 1);
+				}
+				else
+					escapedSeparator = true;
+			}
+
+			/* check if the separator contains formatting and sanitize it */
+			if (!escapedSeparator)
+				return { fmt, format };
+			for (size_t i = 0; i < fmt.size(); ++i) {
+				_buffer.push_back(fmt[i]);
+				if (fmt[i] == U'@')
+					++i;
+			}
+			return{ _buffer, format };
+		}
+
+		template <class ItType>
+		bool FormatRangeOut(auto& sink, std::u32string_view format, std::u32string_view separator, const ItType& begin, const ItType& end) {
+			bool separate = false;
+
+			/* iterate over the elements and write them out */
+			for (ItType it = begin; it != end; ++it) {
+				if (separate && !separator.empty())
+					str::FastcodeAllTo<str::CodeError::replace>(sink, separator);
+				separate = true;
+
+				/* format the value itself */
+				if (!str::CallFormat(sink, *it, format))
+					return false;
+			}
+			return true;
+		}
+
+		bool FormatRepeatOut(auto& sink, size_t count, std::u32string_view format, std::u32string_view separator, const auto& value) {
+			/* check if the value is being written out at all or just once */
+			if (count == 0)
+				return true;
+			if (count == 1)
+				return str::CallFormat(sink, value, format);
+
+			/* format the value to a temporary buffer */
+			std::u32string fmtValue;
+			if (!str::CallFormat(fmtValue, value, format))
+				return false;
+
+			/* iterate over the count and write the values and separators out */
+			for (size_t i = 0; i < count; ++i) {
+				if (i > 0 && !separator.empty())
+					str::FastcodeAllTo<str::CodeError::replace>(sink, separator);
+				str::FastcodeAllTo<str::CodeError::replace>(sink, fmtValue);
+			}
+			return true;
+		}
 	}
 
 	/*	Normal padding but:
@@ -1021,91 +1096,6 @@ namespace str {
 		}
 	};
 
-	/* No formatting rules will be respected, as the internally stored rules will be applied to the argument */
-	template <class FmtType, class Type> struct Formatter<str::As<FmtType, Type>> {
-		constexpr bool operator()(str::IsSink auto& sink, const str::As<FmtType, Type>& val, std::u32string_view fmt) const {
-			/* ensure that the formatting string is empty */
-			if (!fmt.empty())
-				return false;
-
-			/* check if the formatter can be used directly */
-			if constexpr (str::EffSame<str::StringChar<FmtType>, char32_t>)
-				return str::CallFormat(sink, val.value, val.format);
-
-			/* convert the formatting and write the value out */
-			else {
-				std::u32string buffer;
-				str::FastcodeAllTo<str::CodeError::replace>(buffer, val.format);
-				return str::CallFormat(sink, val.value, buffer);
-			}
-		}
-	};
-
-	/*	Normal padding
-	*	[%any%]: separator to be used (escape @ using @@ within this part; default: '')
-	*	[@%any%]: formatter to be used for the elements */
-	template <class ItType> struct Formatter<str::Range<ItType>> {
-		constexpr bool operator()(str::IsSink auto& sink, const str::Range<ItType>& val, std::u32string_view fmt) const {
-			auto [padding, rest] = fmt::ParsePadding(fmt);
-
-			/* split off the separator and element formatter */
-			std::u32string_view separator = rest, format;
-			bool escapedSeparator = false, separate = false;
-			for (size_t i = 0; i < separator.size(); ++i) {
-				if (separator[i] != U'@')
-					continue;
-				if (++i >= separator.size() || separator[i] != U'@') {
-					format = separator.substr(i);
-					separator = separator.substr(0, i - 1);
-				}
-				else
-					escapedSeparator = true;
-			}
-
-			/* check if the separator contains formatting and sanitize it */
-			std::u32string _separator;
-			if (escapedSeparator) {
-				for (size_t i = 0; i < separator.size(); ++i) {
-					_separator.push_back(separator[i]);
-					if (separator[i] == U'@')
-						++i;
-				}
-				separator = _separator;
-			}
-
-			/* check if the string can just be appended */
-			if (padding.minimum <= 1 && padding.maximum == 0) {
-				/* iterate over the elements and write them out */
-				for (ItType it = val.begin; it != val.end; ++it) {
-					if (separate)
-						str::FastcodeAllTo<str::CodeError::replace>(sink, separator);
-					separate = true;
-
-					/* format the value itself */
-					if (!str::CallFormat(sink, *it, format))
-						return false;
-				}
-				return true;
-			}
-
-			/* write the string to an intermediate buffer */
-			std::u32string buffer;
-			for (ItType it = val.begin; it != val.end; ++it) {
-				if (separate)
-					str::FastcodeAllTo<str::CodeError::replace>(buffer, separator);
-				separate = true;
-
-				/* format the value itself */
-				if (!str::CallFormat(buffer, *it, format))
-					return false;
-			}
-
-			/* write the padded string to the sink */
-			fmt::WritePadded(sink, buffer, padding);
-			return true;
-		}
-	};
-
 	/*	Float formatting
 	*	[_]: use space between value and unit
 	*	[s]: use simple si-prefixes (i.e. ascii-only)
@@ -1163,6 +1153,75 @@ namespace str {
 			std::u32string buffer = detail::WriteFltBuffered(flt, number, floatArgs);
 			detail::SiEpilogueInto(buffer, scale.prefix, val.unit, space, always, two);
 			fmt::WritePadded(sink, buffer, flt.padding);
+			return true;
+		}
+	};
+
+	/* No formatting rules will be respected, as the internally stored rules will be applied to the argument */
+	template <class FmtType, class Type> struct Formatter<str::As<FmtType, Type>> {
+		constexpr bool operator()(str::IsSink auto& sink, const str::As<FmtType, Type>& val, std::u32string_view fmt) const {
+			/* ensure that the formatting string is empty */
+			if (!fmt.empty())
+				return false;
+
+			/* check if the formatter can be used directly */
+			if constexpr (str::EffSame<str::StringChar<FmtType>, char32_t>)
+				return str::CallFormat(sink, val.value, val.format);
+
+			/* convert the formatting and write the value out */
+			else {
+				std::u32string buffer;
+				str::FastcodeAllTo<str::CodeError::replace>(buffer, val.format);
+				return str::CallFormat(sink, val.value, buffer);
+			}
+		}
+	};
+
+	/*	Normal padding
+	*	[%any%]: separator to be used (escape @ using @@ within this part; default: '')
+	*	[@%any%]: formatter to be used for the elements */
+	template <class ItType> struct Formatter<str::Range<ItType>> {
+		constexpr bool operator()(str::IsSink auto& sink, const str::Range<ItType>& val, std::u32string_view fmt) const {
+			auto [padding, rest] = fmt::ParsePadding(fmt);
+
+			/* parse the separator and element formatter */
+			std::u32string _separator;
+			auto [separator, format] = detail::ParseElementFormatting(rest, _separator);
+			bool separate = false;
+
+			/* check if the string can just be appended */
+			if (padding.minimum <= 0 && padding.maximum == 0)
+				return detail::FormatRangeOut(sink, format, separator, val.begin, val.end);
+
+			/* write the string to an intermediate buffer and write the padded string to the sink */
+			std::u32string buffer;
+			if (!detail::FormatRangeOut(buffer, format, separator, val.begin, val.end))
+				return false;
+			fmt::WritePadded(sink, buffer, padding);
+			return true;
+		}
+	};
+
+	/*	Normal padding
+	*	[%any%]: separator to be used (escape @ using @@ within this part; default: '')
+	*	[@%any%]: formatter to be used for the elements */
+	template <class Type> struct Formatter<str::Repeat<Type>> {
+		constexpr bool operator()(str::IsSink auto& sink, const str::Repeat<Type>& val, std::u32string_view fmt) const {
+			auto [padding, rest] = fmt::ParsePadding(fmt);
+
+			/* parse the separator and element formatter */
+			std::u32string _separator;
+			auto [separator, format] = detail::ParseElementFormatting(rest, _separator);
+
+			/* check if the value can just be written out to the sink */
+			if (padding.minimum <= 0 && padding.maximum == 0)
+				return detail::FormatRepeatOut(sink, val.count, format, separator, val.value);
+
+			/* write the string to an intermediate buffer and write the padded string to the sink */
+			std::u32string buffer;
+			if (!detail::FormatRepeatOut(buffer, val.count, format, separator, val.value))
+				return false;
+			fmt::WritePadded(sink, buffer, padding);
 			return true;
 		}
 	};
